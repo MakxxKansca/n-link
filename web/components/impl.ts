@@ -1,4 +1,5 @@
 import { Encoder } from '@msgpack/msgpack';
+import { usbDiag } from './usbLogger';
 
 export enum UsbError {
   NotFound = 'NotFound',
@@ -104,6 +105,9 @@ export default class UsbCompat {
           cmd.endpoint & ~0x80,
           cmd.data
         );
+        if (res.status !== 'ok') {
+          usbDiag.log('bulkTransferOut', { endpoint: cmd.endpoint, status: res.status }, 'ERROR');
+        }
         const reply: BulkTransferOutReply = { Ok: res.bytesWritten };
         return reply;
       } else if (cmd.usbCmd === 'bulkTransferIn') {
@@ -111,19 +115,61 @@ export default class UsbCompat {
           cmd.endpoint & ~0x80,
           cmd.length
         );
+        let bytes: Uint8Array;
+        if (res.data && res.data.byteLength > 0) {
+          bytes = new Uint8Array(
+            res.data.buffer,
+            res.data.byteOffset,
+            res.data.byteLength
+          );
+        } else {
+          bytes = new Uint8Array(0);
+        }
+
+        // TI-Nspire CX II (OS 6.0.3+):
+        // Handheld transmits 64-byte NNSE packets with 1 trailing padding byte (65 bytes total).
+        // Trim bytes to completeLength so checksum equals 0xFFFF.
+        if (
+          bytes.length >= 12 &&
+          ((bytes[1] & ~0x80) >= 0x01 && (bytes[1] & ~0x80) <= 0x04) &&
+          (bytes[3] === 0xFE || bytes[3] === 0x01)
+        ) {
+          const completeLength = (bytes[6] << 8) | bytes[7];
+          if (completeLength >= 12 && completeLength < bytes.length) {
+            bytes = bytes.subarray(0, completeLength);
+          }
+        }
+
+        if (res.status !== 'ok') {
+          usbDiag.log('bulkTransferIn', { endpoint: cmd.endpoint, status: res.status }, 'ERROR');
+        }
         const reply: BulkTransferInReply = {
-          Ok: new Uint8Array(res.data!.buffer),
+          Ok: bytes,
         };
         return reply;
       } else if (cmd.usbCmd === 'selectConfiguration') {
+        usbDiag.log('selectConfiguration', { config: cmd.config }, 'INFO');
         await this.devices[cmd.device].selectConfiguration(cmd.config);
+        usbDiag.log('selectConfiguration', { config: cmd.config }, 'OK');
       } else if (cmd.usbCmd === 'claimInterface') {
+        usbDiag.log('claimInterface', { interfaceNumber: cmd.number }, 'INFO');
         await this.devices[cmd.device].claimInterface(cmd.number);
+        usbDiag.log('claimInterface', { interfaceNumber: cmd.number }, 'OK');
       } else if (cmd.usbCmd === 'releaseInterface') {
+        usbDiag.log('releaseInterface', { interfaceNumber: cmd.number }, 'INFO');
         await this.devices[cmd.device].releaseInterface(cmd.number);
+        usbDiag.log('releaseInterface', { interfaceNumber: cmd.number }, 'OK');
       } else if (cmd.usbCmd === 'resetDevice') {
-        await this.devices[cmd.device].reset();
+        usbDiag.log('resetDevice', {}, 'INFO');
+        try {
+          await this.devices[cmd.device].reset();
+          usbDiag.log('resetDevice', {}, 'OK');
+        } catch (e) {
+          usbDiag.log('resetDevice (ignorado en Windows)', {}, 'OK', e);
+          console.warn('Ignoring resetDevice on Windows Chromium:', e);
+        }
       } else if (cmd.usbCmd === 'activeConfigDescriptor') {
+        usbDiag.log('activeConfigDescriptor', {}, 'INFO');
         const configuration = this.devices[cmd.device].configuration!;
         const reply: ActiveConfigDescriptorReply = {
           Ok: {
@@ -144,12 +190,14 @@ export default class UsbCompat {
             }),
           },
         };
+        usbDiag.log('activeConfigDescriptor', { configValue: configuration?.configurationValue }, 'OK');
         return reply;
       }
       const reply: NullReply = { Ok: null };
       return reply;
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      usbDiag.log(cmd.usbCmd, cmd, 'ERROR', e);
       this.lastError = e;
       return {
         Err: { [exceptionMap[e.name as string] || UsbError.Unknown]: null },

@@ -1,3 +1,4 @@
+import { usbDiag } from './usbLogger';
 import { Component, Vue } from 'vue-property-decorator';
 import { RpcProvider } from 'worker-rpc';
 import { saveAs } from 'file-saver';
@@ -191,8 +192,11 @@ class Devices extends Vue implements GenericDevices {
   }
 
   async open(dev: string) {
+    usbDiag.clear();
     const device = this.devices[dev].device;
+    usbDiag.log('device.open', { name: device.productName, vid: device.vendorId, pid: device.productId }, 'INFO');
     await device.open();
+    usbDiag.log('device.open', { opened: device.opened }, 'OK');
     const worker: Worker & Partial<WorkerExt> = new UsbWorker();
     const sab = new SharedArrayBuffer(10000);
     const compat = new UsbCompat(sab);
@@ -205,10 +209,15 @@ class Devices extends Vue implements GenericDevices {
         compat.lastError = undefined;
         try {
           return await rpc.rpc(id, payload, transfer);
-        } catch (e) {
-          console.log(e, compat.lastError);
-          if (compat.lastError) throw compat.lastError;
-          throw new DOMException(e.toString());
+        } catch (e: any) {
+          console.error('[RPC Error]', id, e, compat.lastError);
+          const baseErr = compat.lastError || (e instanceof Error ? e : new Error(String(e)));
+          const enrichedErr = new Error(baseErr.message || String(baseErr));
+          enrichedErr.name = baseErr.name || 'UsbCommunicationError';
+          (enrichedErr as any).usbLogs = usbDiag.getRecentLogs();
+          (enrichedErr as any).rpcCommand = id;
+          (enrichedErr as any).lastUsbDetails = usbDiag.lastErrorDetails;
+          throw enrichedErr;
         }
       },
     };
@@ -230,6 +239,8 @@ class Devices extends Vue implements GenericDevices {
       pid: device.productId,
     });
     await this.update(dev);
+    // Brief 50ms settle pause
+    await new Promise((r) => setTimeout(r, 50));
   }
 
   async close(dev: string) {

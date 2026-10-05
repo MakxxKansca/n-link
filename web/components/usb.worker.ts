@@ -4,10 +4,12 @@ import { RpcProvider } from 'worker-rpc';
 // eslint-disable-next-line import/no-absolute-path
 import type { Calculator } from 'web-libnspire';
 
-console.log('worker!');
+console.log('[Worker] UsbWorker initialized');
 const ctx: Worker = self as any;
 const module = import('web-libnspire');
 let calc: Calculator | undefined;
+let initParams: { id: number; sab: SharedArrayBuffer; vid: number; pid: number } | undefined;
+
 const rpcProvider = new RpcProvider((message, transfer: any) =>
   ctx.postMessage(message, transfer)
 );
@@ -17,9 +19,22 @@ type Path = { path: string };
 type Data = { data: Uint8Array };
 type SrcDest = { src: string; dest: string };
 
-rpcProvider.registerRpcHandler<{id: number, sab: SharedArrayBuffer, vid: number, pid: number}>('init', async ({ id, sab, vid, pid }) => {
-  if (calc) calc.free();
-  calc = new (await module).Calculator(id, vid, pid, new Int32Array(sab));
+async function createCalc(params: { id: number; sab: SharedArrayBuffer; vid: number; pid: number }) {
+  if (calc) {
+    try {
+      calc.free();
+    } catch (e) {
+      console.warn('[Worker] Error freeing calc:', e);
+    }
+  }
+  const mod = await module;
+  calc = new mod.Calculator(params.id, params.vid, params.pid, new Int32Array(params.sab));
+  return calc;
+}
+
+rpcProvider.registerRpcHandler<{id: number, sab: SharedArrayBuffer, vid: number, pid: number}>('init', async (params) => {
+  initParams = params;
+  await createCalc(params);
 });
 
 rpcProvider.registerRpcHandler('updateDevice', async () => {
@@ -62,5 +77,33 @@ rpcProvider.registerRpcHandler<SrcDest>('copy', async ({ src, dest }) => {
 });
 
 rpcProvider.registerRpcHandler<Path>('listDir', async ({ path }) => {
-  return calc?.list_dir(path);
+  console.log('[Worker] listDir requested for path:', JSON.stringify(path));
+  let lastErr: any;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (attempt > 1) {
+        console.log(`[Worker] listDir retry attempt #${attempt}...`);
+      }
+      const res = calc?.list_dir(path);
+      console.log('[Worker] listDir success on attempt', attempt, 'result:', res);
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      const errMsg = String(err?.message || err);
+      console.warn(`[Worker] listDir attempt #${attempt} failed:`, errMsg);
+      if (errMsg.includes('Busy') && initParams) {
+        console.log('[Worker] Calculator reported Busy. Re-instantiating Calculator instance to clear stuck handle/service...');
+        await new Promise((r) => setTimeout(r, 350));
+        try {
+          await createCalc(initParams);
+          await new Promise((r) => setTimeout(r, 200));
+        } catch (reinitErr) {
+          console.error('[Worker] Re-instantiating Calculator failed:', reinitErr);
+        }
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastErr;
 });
